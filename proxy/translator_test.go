@@ -399,6 +399,34 @@ func schemaContainsKey(value interface{}, key string) bool {
 	return false
 }
 
+func TestParseModelAndThinkingStripsClaudeCode1MSuffix(t *testing.T) {
+	model, thinking := ParseModelAndThinking("claude-opus-4-8[1m]", "-thinking")
+	if model != "claude-opus-4.8" || thinking {
+		t.Fatalf("ParseModelAndThinking([1m]) = (%q, %v), want claude-opus-4.8 false", model, thinking)
+	}
+
+	model, thinking = ParseModelAndThinking("claude-sonnet-5-thinking[1m]", "-thinking")
+	if model != "claude-sonnet-5" || !thinking {
+		t.Fatalf("ParseModelAndThinking(thinking [1m]) = (%q, %v), want claude-sonnet-5 true", model, thinking)
+	}
+}
+
+func TestClaudeEffortInjectsThinkingPrompt(t *testing.T) {
+	payload := ClaudeToKiro(&ClaudeRequest{
+		Model:     "claude-sonnet-5",
+		Effort:    "xhigh",
+		Messages:  []ClaudeMessage{{Role: "user", Content: "hello"}},
+		MaxTokens: 1024,
+	}, false)
+	if len(payload.ConversationState.History) == 0 || payload.ConversationState.History[0].UserInputMessage == nil {
+		t.Fatalf("expected system priming history with thinking prompt")
+	}
+	content := payload.ConversationState.History[0].UserInputMessage.Content
+	if !strings.Contains(content, "<thinking_mode>enabled</thinking_mode>") || !strings.Contains(content, "<max_thinking_length>128000</max_thinking_length>") {
+		t.Fatalf("expected xhigh effort thinking prompt, got %q", content)
+	}
+}
+
 func TestParseModelAndThinking(t *testing.T) {
 	tests := []struct {
 		name         string

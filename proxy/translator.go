@@ -42,6 +42,45 @@ var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 <max_thinking_length>200000</max_thinking_length>`
 
+func thinkingPromptForLength(maxLen int) string {
+	if maxLen <= 0 {
+		maxLen = 200000
+	}
+	return fmt.Sprintf("<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>", maxLen)
+}
+
+func thinkingPromptForClaudeRequest(req *ClaudeRequest) string {
+	if req != nil && req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
+		return thinkingPromptForLength(req.Thinking.BudgetTokens)
+	}
+
+	if req != nil {
+		switch strings.ToLower(strings.TrimSpace(req.Effort)) {
+		case "low":
+			return thinkingPromptForLength(4096)
+		case "medium":
+			return thinkingPromptForLength(16000)
+		case "high":
+			return thinkingPromptForLength(64000)
+		case "xhigh":
+			return thinkingPromptForLength(128000)
+		case "max":
+			return thinkingPromptForLength(200000)
+		}
+	}
+
+	return ThinkingModePrompt
+}
+
+func isClaudeEffortRequested(effort string) bool {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
+}
+
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
@@ -67,6 +106,7 @@ const minRecentHistoryTurns = 4
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
 // and reports whether thinking mode was requested via the configured suffix.
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
+	model = stripClaudeCodeContextSuffix(model)
 	lower := strings.ToLower(model)
 	thinking := false
 
@@ -104,6 +144,17 @@ func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, 
 	return actualModel, suffixThinking || isClaudeThinkingRequested(thinkingCfg)
 }
 
+func stripClaudeCodeContextSuffix(model string) string {
+	trimmed := strings.TrimSpace(model)
+	lower := strings.ToLower(trimmed)
+	for _, suffix := range []string{"[1m]", "[1m-context]"} {
+		if strings.HasSuffix(lower, suffix) {
+			return trimmed[:len(trimmed)-len(suffix)]
+		}
+	}
+	return model
+}
+
 func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
 	if thinkingCfg == nil {
 		return false
@@ -128,6 +179,7 @@ type ClaudeRequest struct {
 	Stream      bool                  `json:"stream,omitempty"`
 	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
+	Effort      string                `json:"effort,omitempty"`
 	Tools       []ClaudeTool          `json:"tools,omitempty"`
 	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
 }
@@ -200,8 +252,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
+	if req != nil && isClaudeEffortRequested(req.Effort) {
+		thinking = true
+	}
+
 	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	systemPrompt := buildClaudeSystemPrompt(req.System, thinking, thinkingPromptForClaudeRequest(req))
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -344,16 +400,19 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+func buildClaudeSystemPrompt(system interface{}, thinking bool, thinkingPrompt string) string {
 	systemPrompt := extractSystemPrompt(system)
 	systemPrompt = applyPromptFilters(systemPrompt)
 	if !thinking {
 		return systemPrompt
 	}
-	if systemPrompt == "" {
-		return ThinkingModePrompt
+	if strings.TrimSpace(thinkingPrompt) == "" {
+		thinkingPrompt = ThinkingModePrompt
 	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+	if systemPrompt == "" {
+		return thinkingPrompt
+	}
+	return thinkingPrompt + "\n\n" + systemPrompt
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -531,14 +590,19 @@ func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeReq
 	}
 
 	cloned := *req
+	if isClaudeEffortRequested(req.Effort) {
+		thinking = true
+	}
 	if thinking {
-		cloned.System = prependThinkingSystem(req.System)
+		cloned.System = prependThinkingSystem(req.System, thinkingPromptForClaudeRequest(req))
 	}
 	return &cloned
 }
 
-func prependThinkingSystem(system interface{}) interface{} {
-	thinkingText := ThinkingModePrompt
+func prependThinkingSystem(system interface{}, thinkingText string) interface{} {
+	if strings.TrimSpace(thinkingText) == "" {
+		thinkingText = ThinkingModePrompt
+	}
 	if hasClaudeSystemContent(system) {
 		thinkingText += "\n"
 	}

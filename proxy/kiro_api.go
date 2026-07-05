@@ -183,7 +183,11 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		return "", fmt.Errorf("account is nil")
 	}
 	if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
-		return profileArn, nil
+		if isValidProfileArn(profileArn) {
+			return profileArn, nil
+		}
+		logger.Warnf("[ProfileArn] Ignoring invalid cached profile ARN for %s: %s", accountEmailForLog(account), profileArn)
+		account.ProfileArn = ""
 	}
 
 	profileLookupSuppressed := isProfileArnResolutionSuppressed(account)
@@ -207,7 +211,7 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	// Fallback: refresh token to get profileArn from auth response
 	if account.RefreshToken != "" {
 		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
-		if refreshErr == nil && refreshedArn != "" {
+		if refreshErr == nil && refreshedArn != "" && isValidProfileArn(refreshedArn) {
 			if updateErr := config.UpdateAccountProfileArn(account.ID, refreshedArn); updateErr != nil {
 				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
 			}
@@ -383,12 +387,16 @@ func listAvailableProfiles(account *config.Account) (string, error) {
 	return "", fmt.Errorf("empty profile list")
 }
 
+func isValidProfileArn(profileArn string) bool {
+	return strings.HasPrefix(strings.TrimSpace(profileArn), "arn:aws:codewhisperer:")
+}
+
 func withProfileArnQuery(rawURL string, account *config.Account) string {
 	if account == nil {
 		return rawURL
 	}
 	profileArn := strings.TrimSpace(account.ProfileArn)
-	if profileArn == "" {
+	if profileArn == "" || !isValidProfileArn(profileArn) {
 		return rawURL
 	}
 	return rawURL + "&profileArn=" + neturl.QueryEscape(profileArn)

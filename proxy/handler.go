@@ -18,19 +18,41 @@ import (
 )
 
 const tokenRefreshSkewSeconds int64 = 120
+const proactiveTokenRefreshSeconds int64 = 50 * 60
+
+func accountSupportsAutoRefresh(account *config.Account) bool {
+	if account == nil || strings.TrimSpace(account.RefreshToken) == "" {
+		return false
+	}
+	if account.AuthMethod == "external_idp" {
+		return strings.TrimSpace(account.ClientID) != "" && strings.TrimSpace(account.TokenEndpoint) != ""
+	}
+	return true
+}
+
+func accountNeedsTokenRefresh(account *config.Account, proactive bool) bool {
+	if account == nil || account.ExpiresAt == 0 || !accountSupportsAutoRefresh(account) {
+		return false
+	}
+	threshold := tokenRefreshSkewSeconds
+	if proactive {
+		threshold = proactiveTokenRefreshSeconds
+	}
+	return time.Now().Unix() >= account.ExpiresAt-threshold
+}
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time      int64   `json:"time"`      // Unix timestamp
+	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
+	Model     string  `json:"model"`     // Requested model
+	AccountID string  `json:"accountId"` // Account used
+	Status    string  `json:"status"`    // "success" or "error"
+	Error     string  `json:"error"`     // Error message (empty on success)
+	ErrorType string  `json:"errorType"` // Error category (empty on success)
+	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
+	Duration  int64   `json:"duration"`  // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -285,7 +307,7 @@ func (h *Handler) refreshAllAccounts() {
 		}
 
 		// 检查 token 是否需要刷新
-		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+		if accountNeedsTokenRefresh(account, true) {
 			newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
 			if err != nil {
 				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
@@ -782,6 +804,9 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	if isClaudeEffortRequested(req.Effort) {
+		thinking = true
+	}
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 
@@ -825,6 +850,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	if isClaudeEffortRequested(req.Effort) {
+		thinking = true
+	}
 	req.Model = actualModel
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
@@ -2101,7 +2129,7 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 
 // ensureValidToken 确保 token 有效
 func (h *Handler) ensureValidToken(account *config.Account) error {
-	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
+	if !accountNeedsTokenRefresh(account, false) {
 		return nil
 	}
 
@@ -2114,7 +2142,7 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 		account.RefreshToken = latest.RefreshToken
 		account.ExpiresAt = latest.ExpiresAt
 		account.ProfileArn = latest.ProfileArn
-		if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
+		if !accountNeedsTokenRefresh(account, false) {
 			return nil
 		}
 	}
@@ -2888,13 +2916,16 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ClientID     string `json:"clientId"`
-		ClientSecret string `json:"clientSecret"`
-		AuthMethod   string `json:"authMethod"`
-		Provider     string `json:"provider"`
-		Region       string `json:"region"`
+		AccessToken   string `json:"accessToken"`
+		RefreshToken  string `json:"refreshToken"`
+		ClientID      string `json:"clientId"`
+		ClientSecret  string `json:"clientSecret"`
+		TokenEndpoint string `json:"tokenEndpoint"`
+		IssuerUrl     string `json:"issuerUrl"`
+		Scopes        string `json:"scopes"`
+		AuthMethod    string `json:"authMethod"`
+		Provider      string `json:"provider"`
+		Region        string `json:"region"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -2923,6 +2954,8 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	switch strings.ToLower(req.AuthMethod) {
 	case "idc", "builderid", "enterprise":
 		req.AuthMethod = "idc"
+	case "external_idp", "external-idp", "azuread", "entra", "entra_id", "m365":
+		req.AuthMethod = "external_idp"
 	case "social", "google", "github":
 		req.AuthMethod = "social"
 	default:
@@ -2937,11 +2970,14 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	// 本地缓存里的 accessToken 不携带可信的过期时间，盲猜短 TTL 会让账号在选号时
 	// 永远被跳过，导致后台/按需刷新都无法触发（详见 ensureValidToken 与 Pick 的过期判定）。
 	tempAccount := &config.Account{
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Region:       req.Region,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerUrl:     req.IssuerUrl,
+		Scopes:        req.Scopes,
+		AuthMethod:    req.AuthMethod,
+		Region:        req.Region,
 	}
 	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
 	if err != nil {
@@ -2958,19 +2994,22 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 
 	// 创建账号
 	account := config.Account{
-		ID:           auth.GenerateAccountID(),
-		Email:        email,
-		AccessToken:  accessToken,
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Provider:     req.Provider,
-		Region:       req.Region,
-		ExpiresAt:    expiresAt,
-		Enabled:      true,
-		MachineId:    config.GenerateMachineId(),
-		ProfileArn:   newProfileArn,
+		ID:            auth.GenerateAccountID(),
+		Email:         email,
+		AccessToken:   accessToken,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerUrl:     req.IssuerUrl,
+		Scopes:        req.Scopes,
+		AuthMethod:    req.AuthMethod,
+		Provider:      req.Provider,
+		Region:        req.Region,
+		ExpiresAt:     expiresAt,
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+		ProfileArn:    newProfileArn,
 	}
 
 	if err := config.AddAccount(account); err != nil {
@@ -3239,7 +3278,7 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 	}
 
 	// 检查 token 是否快过期，先刷新
-	if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+	if accountNeedsTokenRefresh(account, true) {
 		if err := refreshTokenIfNeeded(); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
@@ -3339,6 +3378,9 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"refreshToken":      account.RefreshToken,
 		"clientId":          account.ClientID,
 		"clientSecret":      account.ClientSecret,
+		"tokenEndpoint":     account.TokenEndpoint,
+		"issuerUrl":         account.IssuerUrl,
+		"scopes":            account.Scopes,
 		"authMethod":        account.AuthMethod,
 		"provider":          account.Provider,
 		"region":            account.Region,
@@ -3609,15 +3651,18 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 
 	// 构建兼容 Kiro Account Manager 的导出格式
 	type ExportCredentials struct {
-		AccessToken  string `json:"accessToken"`
-		CsrfToken    string `json:"csrfToken"`
-		RefreshToken string `json:"refreshToken"`
-		ClientID     string `json:"clientId,omitempty"`
-		ClientSecret string `json:"clientSecret,omitempty"`
-		Region       string `json:"region,omitempty"`
-		ExpiresAt    int64  `json:"expiresAt"`
-		AuthMethod   string `json:"authMethod,omitempty"`
-		Provider     string `json:"provider,omitempty"`
+		AccessToken   string `json:"accessToken"`
+		CsrfToken     string `json:"csrfToken"`
+		RefreshToken  string `json:"refreshToken"`
+		ClientID      string `json:"clientId,omitempty"`
+		ClientSecret  string `json:"clientSecret,omitempty"`
+		TokenEndpoint string `json:"tokenEndpoint,omitempty"`
+		IssuerUrl     string `json:"issuerUrl,omitempty"`
+		Scopes        string `json:"scopes,omitempty"`
+		Region        string `json:"region,omitempty"`
+		ExpiresAt     int64  `json:"expiresAt"`
+		AuthMethod    string `json:"authMethod,omitempty"`
+		Provider      string `json:"provider,omitempty"`
 	}
 
 	type ExportSubscription struct {
@@ -3693,15 +3738,18 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 			UserId:    a.UserId,
 			MachineId: a.MachineId,
 			Credentials: ExportCredentials{
-				AccessToken:  a.AccessToken,
-				CsrfToken:    "",
-				RefreshToken: a.RefreshToken,
-				ClientID:     a.ClientID,
-				ClientSecret: a.ClientSecret,
-				Region:       a.Region,
-				ExpiresAt:    a.ExpiresAt * 1000, // 转为毫秒时间戳
-				AuthMethod:   authMethod,
-				Provider:     a.Provider,
+				AccessToken:   a.AccessToken,
+				CsrfToken:     "",
+				RefreshToken:  a.RefreshToken,
+				ClientID:      a.ClientID,
+				ClientSecret:  a.ClientSecret,
+				TokenEndpoint: a.TokenEndpoint,
+				IssuerUrl:     a.IssuerUrl,
+				Scopes:        a.Scopes,
+				Region:        a.Region,
+				ExpiresAt:     a.ExpiresAt * 1000, // 转为毫秒时间戳
+				AuthMethod:    authMethod,
+				Provider:      a.Provider,
 			},
 			Subscription: ExportSubscription{
 				Type:  subType,

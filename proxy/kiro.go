@@ -603,6 +603,10 @@ func isLargeContextModel(model string) bool {
 			return false
 		}
 	}
+	if strings.Contains(m, "sonnet-5") || strings.Contains(m, "opus-5") || strings.Contains(m, "fable-5") {
+		return true
+	}
+
 	// Fallback substring checks for non-standard identifiers.
 	for _, tag := range []string{"4.6", "4-6", "4.7", "4-7", "4.8", "4-8", "4.9", "4-9"} {
 		if strings.Contains(m, tag) {

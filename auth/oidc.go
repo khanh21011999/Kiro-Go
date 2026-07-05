@@ -7,6 +7,8 @@ import (
 	"io"
 	"kiro-go/config"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -30,10 +32,60 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	}
 	client := GetAuthClientForProxy(proxyURL)
 
-	if account.AuthMethod == "social" {
+	switch account.AuthMethod {
+	case "social":
 		return refreshSocialToken(account.RefreshToken, client)
+	case "external_idp":
+		return refreshExternalIDPToken(account.RefreshToken, account.ClientID, account.TokenEndpoint, account.Scopes, client)
+	default:
+		return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
 	}
-	return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
+}
+
+// refreshExternalIDPToken refreshes Microsoft Entra / Azure AD tokens captured by
+// the hosted Kiro external IdP flow. These public-client tokens do not have an
+// AWS OIDC clientSecret, so they must be refreshed at the IdP token endpoint.
+func refreshExternalIDPToken(refreshToken, clientID, tokenEndpoint, scopes string, client *http.Client) (string, string, int64, string, error) {
+	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(tokenEndpoint) == "" {
+		return "", "", 0, "", fmt.Errorf("external_idp refresh requires clientId and tokenEndpoint")
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("client_id", clientID)
+	form.Set("refresh_token", refreshToken)
+	if strings.TrimSpace(scopes) != "" {
+		form.Set("scope", scopes)
+	}
+
+	req, _ := http.NewRequest("POST", tokenEndpoint, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", 0, "", err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return "", "", 0, "", fmt.Errorf("external_idp refresh failed: %d %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", "", 0, "", err
+	}
+	if result.RefreshToken == "" {
+		result.RefreshToken = refreshToken
+	}
+
+	expiresAt := time.Now().Unix() + int64(result.ExpiresIn)
+	return result.AccessToken, result.RefreshToken, expiresAt, "", nil
 }
 
 // refreshOIDCToken IdC/Builder ID token 刷新
