@@ -318,6 +318,33 @@ func TestNormalizeChunkOverlapDelta(t *testing.T) {
 	}
 }
 
+func TestNormalizeChunkPreservesMarkdownTablePipes(t *testing.T) {
+	prev := "| Name | Qty |"
+
+	if got := normalizeChunk("| Price |\n| --- | --- | --- |", &prev); got != "| Price |\n| --- | --- | --- |" {
+		t.Fatalf("expected markdown table chunk to keep leading pipe, got %q", got)
+	}
+}
+
+func TestParseEventStreamPreservesMarkdownTableChunks(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "| Name | Qty | Price |\n| --- | --- | --- |"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "\n| Apple | 2 | 3.50 |"}),
+	}, nil))
+
+	var got string
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(text string, _ bool) { got += text },
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	want := "| Name | Qty | Price |\n| --- | --- | --- |\n| Apple | 2 | 3.50 |"
+	if got != want {
+		t.Fatalf("expected markdown table preserved, got %q", got)
+	}
+}
+
 func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 	stream := bytes.NewReader(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
 		"toolUseId": "toolu_1",

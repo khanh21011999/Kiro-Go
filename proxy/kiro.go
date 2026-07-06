@@ -845,6 +845,11 @@ func normalizeChunk(chunk string, previous *string) string {
 		return ""
 	}
 
+	if isMarkdownSensitiveChunk(prev) || isMarkdownSensitiveChunk(chunk) {
+		*previous = chunk
+		return chunk
+	}
+
 	maxOverlap := 0
 	maxLen := len(prev)
 	if len(chunk) < maxLen {
@@ -863,6 +868,10 @@ func normalizeChunk(chunk string, previous *string) string {
 	}
 
 	return chunk
+}
+
+func isMarkdownSensitiveChunk(s string) bool {
+	return strings.ContainsAny(s, "\n|")
 }
 
 func readTokenNumber(m map[string]interface{}, keys ...string) (int, bool) {

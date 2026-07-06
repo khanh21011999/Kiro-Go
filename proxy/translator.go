@@ -1042,8 +1042,9 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 
 	if thinkingContent != "" || includeEmptyThinkingBlock {
 		blocks = append(blocks, ClaudeContentBlock{
-			Type:     "thinking",
-			Thinking: thinkingContent,
+			Type:      "thinking",
+			Thinking:  thinkingContent,
+			Signature: "kiro-go",
 		})
 	}
 

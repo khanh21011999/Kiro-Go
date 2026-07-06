@@ -279,6 +279,9 @@ func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
 	if resp.Content[0].Thinking != "" {
 		t.Fatalf("expected omitted thinking block to have empty content, got %#v", resp.Content[0].Thinking)
 	}
+	if resp.Content[0].Signature == "" {
+		t.Fatalf("expected thinking block to include a signature")
+	}
 	if resp.Content[1].Type != "text" || resp.Content[1].Text != "final answer" {
 		t.Fatalf("expected text block to be preserved, got %#v", resp.Content[1])
 	}
