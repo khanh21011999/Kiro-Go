@@ -58,7 +58,7 @@ var kiroEndpoints = []kiroEndpoint{
 	},
 }
 
-const endpointQuotaCooldown = 2 * time.Minute
+const endpointQuotaCooldown = 15 * time.Minute
 
 var endpointQuotaCooldowns sync.Map
 
@@ -385,15 +385,19 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 
 	var lastErr error
+	var skippedCooldowns int
+	var attemptedEndpoints int
 	callStart := time.Now()
 	for _, ep := range endpoints {
 		if until, ok := endpointCooldownUntil(account, ep); ok {
 			msg := fmt.Sprintf("endpoint %s cooling down after quota error until %s", ep.Name, until.Format(time.RFC3339))
+			skippedCooldowns++
 			lastErr = fmt.Errorf("%s", msg)
 			notifyEndpointAttempt(callback, KiroEndpointAttempt{Name: ep.Name, Error: msg, Skipped: true})
-			logger.Warnf("[KiroAPI] Skipping endpoint %s during quota cooldown", ep.Name)
+			logger.Debugf("[KiroAPI] Skipping endpoint %s during quota cooldown", ep.Name)
 			continue
 		}
+		attemptedEndpoints++
 
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
@@ -478,6 +482,9 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 
 	if lastErr != nil {
+		if attemptedEndpoints == 0 && skippedCooldowns > 0 {
+			logger.Warnf("[KiroAPI] All endpoints are in quota cooldown for %s; failing fast", accountEmailForLog(account))
+		}
 		return lastErr
 	}
 	return fmt.Errorf("all endpoints failed")
@@ -526,7 +533,16 @@ func accountEmailForLog(account *config.Account) string {
 	if account == nil {
 		return "<nil>"
 	}
-	return account.Email
+	if email := strings.TrimSpace(account.Email); email != "" {
+		return email
+	}
+	if id := strings.TrimSpace(account.ID); id != "" {
+		if len(id) > 8 {
+			return id[:8] + "..."
+		}
+		return id
+	}
+	return "<unknown>"
 }
 
 // ==================== Event Stream Parsing ====================

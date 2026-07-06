@@ -310,7 +310,7 @@ func (h *Handler) refreshAllAccounts() {
 		if accountNeedsTokenRefresh(account, true) {
 			newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
 			if err != nil {
-				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
+				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", accountEmailForLog(account), err)
 				h.handleAccountFailure(account, err)
 				continue
 			}
@@ -330,12 +330,12 @@ func (h *Handler) refreshAllAccounts() {
 		// 刷新账户信息
 		info, err := RefreshAccountInfo(account)
 		if err != nil {
-			logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
+			logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", accountEmailForLog(account), err)
 			continue
 		}
 
 		config.UpdateAccountInfo(account.ID, *info)
-		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", accountEmailForLog(account), info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
 	}
 	h.pool.Reload()
 }
