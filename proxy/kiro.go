@@ -61,6 +61,7 @@ var kiroEndpoints = []kiroEndpoint{
 const endpointQuotaCooldown = 15 * time.Minute
 
 var endpointQuotaCooldowns sync.Map
+var endpointLastSuccesses sync.Map
 
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
 var kiroHttpStore atomic.Pointer[http.Client]
@@ -284,7 +285,11 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 		primary = 2
 	default:
 		// "auto": Kiro first, then fallback to others
-		return []kiroEndpoint{kiroEndpoints[0], kiroEndpoints[1], kiroEndpoints[2]}
+		return append([]kiroEndpoint(nil), kiroEndpoints...)
+	}
+
+	if primary >= len(kiroEndpoints) {
+		return append([]kiroEndpoint(nil), kiroEndpoints...)
 	}
 
 	if !fallback {
@@ -329,6 +334,50 @@ func markEndpointQuotaCooldown(account *config.Account, ep kiroEndpoint) {
 
 func clearEndpointQuotaCooldown(account *config.Account, ep kiroEndpoint) {
 	endpointQuotaCooldowns.Delete(endpointCooldownKey(account, ep))
+}
+
+func endpointSuccessKey(account *config.Account) string {
+	if account == nil {
+		return ""
+	}
+	return account.ID
+}
+
+func rememberLastSuccessfulEndpoint(account *config.Account, ep kiroEndpoint) {
+	endpointLastSuccesses.Store(endpointSuccessKey(account), ep.Name)
+}
+
+func lastSuccessfulEndpoint(account *config.Account) (string, bool) {
+	value, ok := endpointLastSuccesses.Load(endpointSuccessKey(account))
+	if !ok {
+		return "", false
+	}
+	name, ok := value.(string)
+	return name, ok && name != ""
+}
+
+func preferLastSuccessfulEndpoint(account *config.Account, endpoints []kiroEndpoint, preferred string) []kiroEndpoint {
+	if strings.ToLower(strings.TrimSpace(preferred)) != "auto" {
+		return endpoints
+	}
+	name, ok := lastSuccessfulEndpoint(account)
+	if !ok {
+		return endpoints
+	}
+	for i, ep := range endpoints {
+		if ep.Name != name {
+			continue
+		}
+		if i == 0 {
+			return endpoints
+		}
+		reordered := make([]kiroEndpoint, 0, len(endpoints))
+		reordered = append(reordered, ep)
+		reordered = append(reordered, endpoints[:i]...)
+		reordered = append(reordered, endpoints[i+1:]...)
+		return reordered
+	}
+	return endpoints
 }
 
 func notifyEndpointAttempt(callback *KiroStreamCallback, attempt KiroEndpointAttempt) {
@@ -382,7 +431,8 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 
 	// Build endpoint list ordered by configuration.
-	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	preferredEndpoint := config.GetPreferredEndpoint()
+	endpoints := preferLastSuccessfulEndpoint(account, getSortedEndpoints(preferredEndpoint), preferredEndpoint)
 
 	var lastErr error
 	var skippedCooldowns int
@@ -478,6 +528,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			logger.Warnf("[KiroAPI] Endpoint %s stream failed before output, trying next endpoint: %v", ep.Name, err)
 			continue
 		}
+		rememberLastSuccessfulEndpoint(account, ep)
 		return nil
 	}
 

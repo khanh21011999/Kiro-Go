@@ -15,6 +15,7 @@ import (
 
 func resetEndpointQuotaCooldownsForTest() {
 	endpointQuotaCooldowns = sync.Map{}
+	endpointLastSuccesses = sync.Map{}
 }
 
 func TestCallKiroAPIRetriesNextEndpointWhenStreamFailsBeforeOutput(t *testing.T) {
@@ -215,6 +216,71 @@ func TestCallKiroAPISkipsEndpointAfterQuotaCooldown(t *testing.T) {
 	}
 	if len(hits) != 1 || hits[0] != "/ok" {
 		t.Fatalf("expected second call to skip quota endpoint and hit ok only, got %#v", hits)
+	}
+}
+
+func TestCallKiroAPIPrefersLastSuccessfulEndpointInAutoMode(t *testing.T) {
+	resetEndpointQuotaCooldownsForTest()
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("auto"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(true); err != nil {
+		t.Fatalf("enable endpoint fallback: %v", err)
+	}
+
+	var hits []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, r.URL.Path)
+		switch r.URL.Path {
+		case "/slow-failure":
+			http.Error(w, "try another", http.StatusInternalServerError)
+		case "/ok":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "ok"}))
+		default:
+			http.Error(w, "unexpected endpoint", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{
+		{URL: server.URL + "/slow-failure", Origin: "AI_EDITOR", Name: "slow"},
+		{URL: server.URL + "/ok", Origin: "AI_EDITOR", Name: "ok"},
+	}
+	defer func() {
+		kiroEndpoints = oldEndpoints
+		resetEndpointQuotaCooldownsForTest()
+	}()
+
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hello",
+		Origin:  "AI_EDITOR",
+	}
+	account := &config.Account{
+		ID:          "acct",
+		AccessToken: "token",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+	}
+
+	if err := CallKiroAPI(account, payload, &KiroStreamCallback{}); err != nil {
+		t.Fatalf("first call should fall back to ok endpoint, got %v", err)
+	}
+	if len(hits) != 2 || hits[0] != "/slow-failure" || hits[1] != "/ok" {
+		t.Fatalf("expected first call to learn ok endpoint after fallback, got %#v", hits)
+	}
+
+	hits = nil
+	if err := CallKiroAPI(account, payload, &KiroStreamCallback{}); err != nil {
+		t.Fatalf("second call should use remembered ok endpoint, got %v", err)
+	}
+	if len(hits) != 1 || hits[0] != "/ok" {
+		t.Fatalf("expected second call to prefer last successful endpoint, got %#v", hits)
 	}
 }
 
