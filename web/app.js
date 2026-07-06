@@ -1519,6 +1519,14 @@
       const d = await res.json();
       if (d.success) {
         addTestLog(t('accounts.testLog.success', email, elapsed, d.reply), 'ok');
+        addTestLog(t('accounts.testLog.timing', d.endpoint || '?', formatMs(d.firstOutputMs), formatMs(d.durationMs)), 'info');
+        addTestLog(t('accounts.testLog.thinking', d.thinkingReceived ? t('common.yes') : t('common.no'), d.thinkingTokens || 0), d.thinkingReceived ? 'ok' : 'info');
+        if (Array.isArray(d.attempts) && d.attempts.length) {
+          d.attempts.forEach(a => {
+            const status = a.skipped ? t('accounts.testLog.skipped') : (a.statusCode || a.error || '?');
+            addTestLog(t('accounts.testLog.attempt', a.name || '?', status, formatMs(a.durationMs || 0)), a.error || a.skipped ? 'err' : 'info');
+          });
+        }
       } else {
         addTestLog(t('accounts.testLog.failed', email, elapsed, d.error || t('common.unknownError')), 'err');
       }
@@ -1527,6 +1535,12 @@
     }
     testModalRunning = false;
     if (modalBtn) modalBtn.removeAttribute('aria-busy');
+  }
+
+  function formatMs(ms) {
+    const n = Number(ms || 0);
+    if (n >= 1000) return (n / 1000).toFixed(1) + 's';
+    return Math.round(n) + 'ms';
   }
 
   // Settings

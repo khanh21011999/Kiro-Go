@@ -29,6 +29,14 @@ type kiroEndpoint struct {
 	Name      string
 }
 
+type KiroEndpointAttempt struct {
+	Name       string
+	StatusCode int
+	DurationMs int64
+	Error      string
+	Skipped    bool
+}
+
 var kiroEndpoints = []kiroEndpoint{
 	{
 		URL:       "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
@@ -49,6 +57,10 @@ var kiroEndpoints = []kiroEndpoint{
 		Name:      "AmazonQ",
 	},
 }
+
+const endpointQuotaCooldown = 2 * time.Minute
+
+var endpointQuotaCooldowns sync.Map
 
 // Global HTTP clients, swappable at runtime to apply proxy reconfiguration without restart.
 var kiroHttpStore atomic.Pointer[http.Client]
@@ -233,12 +245,14 @@ type InferenceConfig struct {
 
 // KiroStreamCallback stream response callbacks
 type KiroStreamCallback struct {
-	OnText         func(text string, isThinking bool)
-	OnToolUse      func(toolUse KiroToolUse)
-	OnComplete     func(inputTokens, outputTokens int)
-	OnError        func(err error)
-	OnCredits      func(credits float64)
-	OnContextUsage func(percentage float64)
+	OnText            func(text string, isThinking bool)
+	OnToolUse         func(toolUse KiroToolUse)
+	OnComplete        func(inputTokens, outputTokens int)
+	OnError           func(err error)
+	OnCredits         func(credits float64)
+	OnContextUsage    func(percentage float64)
+	OnEndpointAttempt func(attempt KiroEndpointAttempt)
+	OnFirstOutput     func(endpoint string, durationMs int64)
 }
 
 // ==================== API Call ====================
@@ -286,6 +300,41 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 		}
 	}
 	return result
+}
+
+func endpointCooldownKey(account *config.Account, ep kiroEndpoint) string {
+	accountID := ""
+	if account != nil {
+		accountID = account.ID
+	}
+	return accountID + "\x00" + ep.Name
+}
+
+func endpointCooldownUntil(account *config.Account, ep kiroEndpoint) (time.Time, bool) {
+	value, ok := endpointQuotaCooldowns.Load(endpointCooldownKey(account, ep))
+	if !ok {
+		return time.Time{}, false
+	}
+	until, ok := value.(time.Time)
+	if !ok || time.Now().After(until) {
+		endpointQuotaCooldowns.Delete(endpointCooldownKey(account, ep))
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+func markEndpointQuotaCooldown(account *config.Account, ep kiroEndpoint) {
+	endpointQuotaCooldowns.Store(endpointCooldownKey(account, ep), time.Now().Add(endpointQuotaCooldown))
+}
+
+func clearEndpointQuotaCooldown(account *config.Account, ep kiroEndpoint) {
+	endpointQuotaCooldowns.Delete(endpointCooldownKey(account, ep))
+}
+
+func notifyEndpointAttempt(callback *KiroStreamCallback, attempt KiroEndpointAttempt) {
+	if callback != nil && callback.OnEndpointAttempt != nil {
+		callback.OnEndpointAttempt(attempt)
+	}
 }
 
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
@@ -336,7 +385,16 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 
 	var lastErr error
+	callStart := time.Now()
 	for _, ep := range endpoints {
+		if until, ok := endpointCooldownUntil(account, ep); ok {
+			msg := fmt.Sprintf("endpoint %s cooling down after quota error until %s", ep.Name, until.Format(time.RFC3339))
+			lastErr = fmt.Errorf("%s", msg)
+			notifyEndpointAttempt(callback, KiroEndpointAttempt{Name: ep.Name, Error: msg, Skipped: true})
+			logger.Warnf("[KiroAPI] Skipping endpoint %s during quota cooldown", ep.Name)
+			continue
+		}
+
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
@@ -367,15 +425,20 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
 
+		attemptStart := time.Now()
 		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+		attemptDuration := time.Since(attemptStart).Milliseconds()
 		if err != nil {
 			lastErr = err
+			notifyEndpointAttempt(callback, KiroEndpointAttempt{Name: ep.Name, DurationMs: attemptDuration, Error: err.Error()})
 			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
 			continue
 		}
 
 		if resp.StatusCode == 429 {
 			resp.Body.Close()
+			markEndpointQuotaCooldown(account, ep)
+			notifyEndpointAttempt(callback, KiroEndpointAttempt{Name: ep.Name, StatusCode: resp.StatusCode, DurationMs: attemptDuration, Error: "quota exhausted"})
 			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
 			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
 			continue
@@ -385,6 +448,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			notifyEndpointAttempt(callback, KiroEndpointAttempt{Name: ep.Name, StatusCode: resp.StatusCode, DurationMs: attemptDuration, Error: lastErr.Error()})
 			// Authentication errors and payment errors are not retried across endpoints.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 				return lastErr
@@ -393,15 +457,69 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
+		clearEndpointQuotaCooldown(account, ep)
+		notifyEndpointAttempt(callback, KiroEndpointAttempt{Name: ep.Name, StatusCode: resp.StatusCode, DurationMs: attemptDuration})
+		observedCallback, sawOutput := kiroCallbackWithOutputObserver(callback, func() {
+			if callback != nil && callback.OnFirstOutput != nil {
+				callback.OnFirstOutput(ep.Name, time.Since(callStart).Milliseconds())
+			}
+		})
+		err = parseEventStream(resp.Body, observedCallback)
 		resp.Body.Close()
-		return err
+		if err != nil {
+			lastErr = err
+			if sawOutput() {
+				return err
+			}
+			logger.Warnf("[KiroAPI] Endpoint %s stream failed before output, trying next endpoint: %v", ep.Name, err)
+			continue
+		}
+		return nil
 	}
 
 	if lastErr != nil {
 		return lastErr
 	}
 	return fmt.Errorf("all endpoints failed")
+}
+
+func kiroCallbackWithOutputObserver(callback *KiroStreamCallback, onFirstOutput func()) (*KiroStreamCallback, func() bool) {
+	if callback == nil {
+		callback = &KiroStreamCallback{}
+	}
+
+	var sawOutput bool
+	wrapped := *callback
+
+	markOutput := func() {
+		if sawOutput {
+			return
+		}
+		sawOutput = true
+		if onFirstOutput != nil {
+			onFirstOutput()
+		}
+	}
+
+	originalOnText := callback.OnText
+	wrapped.OnText = func(text string, isThinking bool) {
+		if text != "" {
+			markOutput()
+		}
+		if originalOnText != nil {
+			originalOnText(text, isThinking)
+		}
+	}
+
+	originalOnToolUse := callback.OnToolUse
+	wrapped.OnToolUse = func(toolUse KiroToolUse) {
+		markOutput()
+		if originalOnToolUse != nil {
+			originalOnToolUse(toolUse)
+		}
+	}
+
+	return &wrapped, func() bool { return sawOutput }
 }
 
 func accountEmailForLog(account *config.Account) string {

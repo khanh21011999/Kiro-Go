@@ -412,7 +412,7 @@ func TestResolveClaudeThinkingResponseOptions(t *testing.T) {
 			wantOmit:   false,
 		},
 		{
-			name:       "summarized forces official thinking blocks",
+			name:       "summarized keeps official thinking blocks for Copilot",
 			thinking:   &ClaudeThinkingConfig{Type: "adaptive", Display: "summarized"},
 			defaultFmt: "reasoning_content",
 			wantFmt:    "thinking",
@@ -460,6 +460,36 @@ func TestMergeUniqueModelsPreservesUnionAcrossAccounts(t *testing.T) {
 		t.Fatalf("expected second model to be claude-opus-4-7, got %q", merged[1].ModelId)
 	}
 }
+
+func TestSendClaudeUpstreamErrorMapsQuotaToRateLimit(t *testing.T) {
+	h := &Handler{}
+	rec := httptest.NewRecorder()
+
+	h.sendClaudeUpstreamError(rec, errString("quota exhausted on CodeWhisperer"))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if body.Error.Type != "rate_limit_error" {
+		t.Fatalf("expected rate_limit_error, got %q", body.Error.Type)
+	}
+	if !strings.Contains(body.Error.Message, "quota exhausted") {
+		t.Fatalf("expected quota message, got %q", body.Error.Message)
+	}
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
 
 func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	models := buildAnthropicModelsResponse([]ModelInfo{{

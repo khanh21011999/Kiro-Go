@@ -49,13 +49,26 @@ func thinkingPromptForLength(maxLen int) string {
 	return fmt.Sprintf("<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>%d</max_thinking_length>", maxLen)
 }
 
+func claudeRequestEffort(req *ClaudeRequest) string {
+	if req == nil {
+		return ""
+	}
+	if strings.TrimSpace(req.Effort) != "" {
+		return req.Effort
+	}
+	if req.OutputConfig != nil {
+		return req.OutputConfig.Effort
+	}
+	return ""
+}
+
 func thinkingPromptForClaudeRequest(req *ClaudeRequest) string {
 	if req != nil && req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
 		return thinkingPromptForLength(req.Thinking.BudgetTokens)
 	}
 
 	if req != nil {
-		switch strings.ToLower(strings.TrimSpace(req.Effort)) {
+		switch strings.ToLower(strings.TrimSpace(claudeRequestEffort(req))) {
 		case "low":
 			return thinkingPromptForLength(4096)
 		case "medium":
@@ -144,6 +157,32 @@ func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, 
 	return actualModel, suffixThinking || isClaudeThinkingRequested(thinkingCfg)
 }
 
+func isClaudeModelWithDefaultThinking(model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	normalized = strings.ReplaceAll(normalized, ".", "-")
+	if strings.Contains(normalized, "1m") {
+		return false
+	}
+	for _, prefix := range []string{
+		"claude-fable-5",
+		"claude-haiku-4-5",
+		"claude-sonnet-4-6",
+		"claude-sonnet-4-5",
+		"claude-sonnet-4",
+		"claude-opus-4-8",
+		"claude-opus-4-7",
+		"claude-opus-4-6",
+		"claude-opus-4-5",
+		"claude-opus-4-1",
+		"claude-opus-4",
+	} {
+		if strings.HasPrefix(normalized, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func stripClaudeCodeContextSuffix(model string) string {
 	trimmed := strings.TrimSpace(model)
 	lower := strings.ToLower(trimmed)
@@ -171,23 +210,28 @@ func MapModel(model string) string {
 // ==================== Claude API 类型 ====================
 
 type ClaudeRequest struct {
-	Model       string                `json:"model"`
-	Messages    []ClaudeMessage       `json:"messages"`
-	MaxTokens   int                   `json:"max_tokens"`
-	Temperature float64               `json:"temperature,omitempty"`
-	TopP        float64               `json:"top_p,omitempty"`
-	Stream      bool                  `json:"stream,omitempty"`
-	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
-	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
-	Effort      string                `json:"effort,omitempty"`
-	Tools       []ClaudeTool          `json:"tools,omitempty"`
-	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+	Model        string                `json:"model"`
+	Messages     []ClaudeMessage       `json:"messages"`
+	MaxTokens    int                   `json:"max_tokens"`
+	Temperature  float64               `json:"temperature,omitempty"`
+	TopP         float64               `json:"top_p,omitempty"`
+	Stream       bool                  `json:"stream,omitempty"`
+	System       interface{}           `json:"system,omitempty"` // string or []SystemBlock
+	Thinking     *ClaudeThinkingConfig `json:"thinking,omitempty"`
+	Effort       string                `json:"effort,omitempty"`
+	OutputConfig *ClaudeOutputConfig   `json:"output_config,omitempty"`
+	Tools        []ClaudeTool          `json:"tools,omitempty"`
+	ToolChoice   interface{}           `json:"tool_choice,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
 	Type         string `json:"type,omitempty"`
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 	Display      string `json:"display,omitempty"`
+}
+
+type ClaudeOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -252,7 +296,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
-	if req != nil && isClaudeEffortRequested(req.Effort) {
+	if req != nil && isClaudeEffortRequested(claudeRequestEffort(req)) {
 		thinking = true
 	}
 
@@ -270,7 +314,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 		if msg.Role == "user" {
 			content, images, toolResults := extractClaudeUserContent(msg.Content)
-			content = normalizeUserContent(content, len(images) > 0)
+			content = normalizeUserContent(content, len(images) > 0 && len(toolResults) == 0)
 
 			if isLast {
 				currentContent = content
@@ -345,10 +389,10 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	finalContent := ""
 	if currentContent != "" {
 		finalContent = currentContent
-	} else if len(currentImages) > 0 {
-		finalContent = normalizeUserContent("", true)
 	} else if len(currentToolResults) > 0 {
 		finalContent = buildToolResultsContinuation(currentToolResults)
+	} else if len(currentImages) > 0 {
+		finalContent = normalizeUserContent("", true)
 	} else {
 		finalContent = minimalFallbackUserContent
 	}
@@ -590,7 +634,7 @@ func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeReq
 	}
 
 	cloned := *req
-	if isClaudeEffortRequested(req.Effort) {
+	if isClaudeEffortRequested(claudeRequestEffort(req)) {
 		thinking = true
 	}
 	if thinking {
@@ -1297,10 +1341,10 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 构建最终内容
 	finalContent := currentContent
 	if finalContent == "" {
-		if len(currentImages) > 0 {
-			finalContent = normalizeUserContent("", true)
-		} else if len(currentToolResults) > 0 {
+		if len(currentToolResults) > 0 {
 			finalContent = buildToolResultsContinuation(currentToolResults)
+		} else if len(currentImages) > 0 {
+			finalContent = normalizeUserContent("", true)
 		} else {
 			finalContent = minimalFallbackUserContent
 		}

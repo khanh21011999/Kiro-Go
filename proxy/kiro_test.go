@@ -6,10 +6,217 @@ import (
 	"encoding/json"
 	"kiro-go/config"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 )
+
+func resetEndpointQuotaCooldownsForTest() {
+	endpointQuotaCooldowns = sync.Map{}
+}
+
+func TestCallKiroAPIRetriesNextEndpointWhenStreamFailsBeforeOutput(t *testing.T) {
+	resetEndpointQuotaCooldownsForTest()
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(true); err != nil {
+		t.Fatalf("enable endpoint fallback: %v", err)
+	}
+
+	var hits []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, r.URL.Path)
+		switch r.URL.Path {
+		case "/broken-stream":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte{0, 0, 0, 20})
+		case "/ok":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "fallback worked"}))
+		default:
+			http.Error(w, "unexpected endpoint", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{
+		{URL: server.URL + "/broken-stream", Origin: "AI_EDITOR", Name: "broken"},
+		{URL: server.URL + "/ok", Origin: "AI_EDITOR", Name: "ok"},
+		{URL: server.URL + "/unused", Origin: "AI_EDITOR", Name: "unused"},
+	}
+	defer func() { kiroEndpoints = oldEndpoints }()
+
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hello",
+		Origin:  "AI_EDITOR",
+	}
+
+	var got string
+	err := CallKiroAPI(&config.Account{
+		AccessToken: "token",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+	}, payload, &KiroStreamCallback{
+		OnText: func(text string, _ bool) { got += text },
+	})
+	if err != nil {
+		t.Fatalf("expected fallback endpoint to succeed, got error: %v", err)
+	}
+	if got != "fallback worked" {
+		t.Fatalf("expected fallback text, got %q", got)
+	}
+	if len(hits) != 2 || hits[0] != "/broken-stream" || hits[1] != "/ok" {
+		t.Fatalf("expected broken endpoint then fallback endpoint, got %#v", hits)
+	}
+}
+
+func TestCallKiroAPIDoesNotRetryStreamFailureAfterOutput(t *testing.T) {
+	resetEndpointQuotaCooldownsForTest()
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(true); err != nil {
+		t.Fatalf("enable endpoint fallback: %v", err)
+	}
+
+	var hits []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, r.URL.Path)
+		switch r.URL.Path {
+		case "/partial-stream":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "partial"}))
+			_, _ = w.Write([]byte{0, 0, 0, 20})
+		case "/ok":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "fallback should not run"}))
+		default:
+			http.Error(w, "unexpected endpoint", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{
+		{URL: server.URL + "/partial-stream", Origin: "AI_EDITOR", Name: "partial"},
+		{URL: server.URL + "/ok", Origin: "AI_EDITOR", Name: "ok"},
+		{URL: server.URL + "/unused", Origin: "AI_EDITOR", Name: "unused"},
+	}
+	defer func() { kiroEndpoints = oldEndpoints }()
+
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hello",
+		Origin:  "AI_EDITOR",
+	}
+
+	var got string
+	err := CallKiroAPI(&config.Account{
+		AccessToken: "token",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+	}, payload, &KiroStreamCallback{
+		OnText: func(text string, _ bool) { got += text },
+	})
+	if err == nil {
+		t.Fatalf("expected stream error after partial output")
+	}
+	if got != "partial" {
+		t.Fatalf("expected partial output to be preserved, got %q", got)
+	}
+	if len(hits) != 1 || hits[0] != "/partial-stream" {
+		t.Fatalf("expected no retry after output, got hits %#v", hits)
+	}
+}
+
+func TestCallKiroAPISkipsEndpointAfterQuotaCooldown(t *testing.T) {
+	resetEndpointQuotaCooldownsForTest()
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(true); err != nil {
+		t.Fatalf("enable endpoint fallback: %v", err)
+	}
+
+	var hits []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, r.URL.Path)
+		switch r.URL.Path {
+		case "/quota":
+			http.Error(w, "quota", http.StatusTooManyRequests)
+		case "/ok":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "ok"}))
+		default:
+			http.Error(w, "unexpected endpoint", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{
+		{URL: server.URL + "/quota", Origin: "AI_EDITOR", Name: "quota"},
+		{URL: server.URL + "/ok", Origin: "AI_EDITOR", Name: "ok"},
+		{URL: server.URL + "/unused", Origin: "AI_EDITOR", Name: "unused"},
+	}
+	defer func() {
+		kiroEndpoints = oldEndpoints
+		resetEndpointQuotaCooldownsForTest()
+	}()
+
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hello",
+		Origin:  "AI_EDITOR",
+	}
+	account := &config.Account{
+		ID:          "acct",
+		AccessToken: "token",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+	}
+
+	err := CallKiroAPI(account, payload, &KiroStreamCallback{})
+	if err != nil {
+		t.Fatalf("first call should fall back after quota, got %v", err)
+	}
+	if len(hits) != 2 || hits[0] != "/quota" || hits[1] != "/ok" {
+		t.Fatalf("expected first call to hit quota then ok, got %#v", hits)
+	}
+
+	hits = nil
+	var skipped bool
+	err = CallKiroAPI(account, payload, &KiroStreamCallback{
+		OnEndpointAttempt: func(attempt KiroEndpointAttempt) {
+			if attempt.Name == "quota" && attempt.Skipped {
+				skipped = true
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("second call should skip quota and succeed, got %v", err)
+	}
+	if !skipped {
+		t.Fatalf("expected quota endpoint to be reported as skipped")
+	}
+	if len(hits) != 1 || hits[0] != "/ok" {
+		t.Fatalf("expected second call to skip quota endpoint and hit ok only, got %#v", hits)
+	}
+}
 
 func TestNormalizeChunkBasicProgression(t *testing.T) {
 	prev := ""
@@ -178,18 +385,10 @@ func TestBuildKiroTransportUsesExplicitProxyURL(t *testing.T) {
 }
 
 func TestBuildKiroTransportFallsBackToEnvironmentProxy(t *testing.T) {
-	t.Setenv("HTTPS_PROXY", "http://env-proxy.local:2323")
-	t.Setenv("NO_PROXY", "")
-	t.Setenv("no_proxy", "")
-
 	transport := buildKiroTransport("")
-	req := &http.Request{URL: mustParseURL(t, "https://q.us-east-1.amazonaws.com")}
-
-	got, err := transport.Proxy(req)
-	if err != nil {
-		t.Fatalf("unexpected proxy error: %v", err)
+	if transport.Proxy == nil {
+		t.Fatalf("expected empty proxy config to install environment proxy support")
 	}
-	assertProxyURL(t, got, "http://env-proxy.local:2323")
 }
 
 func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {

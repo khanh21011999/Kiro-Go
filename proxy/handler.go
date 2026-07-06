@@ -804,7 +804,7 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
-	if isClaudeEffortRequested(req.Effort) {
+	if isClaudeEffortRequested(claudeRequestEffort(&req)) {
 		thinking = true
 	}
 	req.Model = actualModel
@@ -850,7 +850,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
-	if isClaudeEffortRequested(req.Effort) {
+	if isClaudeEffortRequested(claudeRequestEffort(&req)) {
 		thinking = true
 	}
 	req.Model = actualModel
@@ -1252,9 +1252,13 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				continue
 			}
 			h.recordFailureWithDetails("claude", model, account.ID, err)
+			errType := "api_error"
+			if isQuotaErrorMessage(err.Error()) {
+				errType = "rate_limit_error"
+			}
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
-				"error": map[string]string{"type": "api_error", "message": err.Error()},
+				"error": map[string]string{"type": errType, "message": err.Error()},
 			})
 			return
 		}
@@ -1312,7 +1316,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	h.recordFailureWithDetails("claude", model, "", lastErr)
-	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	h.sendClaudeUpstreamError(w, lastErr)
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
@@ -1587,7 +1591,20 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	}
 
 	h.recordFailureWithDetails("claude", model, "", lastErr)
-	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	h.sendClaudeUpstreamError(w, lastErr)
+}
+
+func (h *Handler) sendClaudeUpstreamError(w http.ResponseWriter, err error) {
+	if err == nil {
+		h.sendClaudeError(w, http.StatusInternalServerError, "api_error", "unknown upstream error")
+		return
+	}
+	msg := err.Error()
+	if isQuotaErrorMessage(msg) {
+		h.sendClaudeError(w, http.StatusTooManyRequests, "rate_limit_error", msg)
+		return
+	}
+	h.sendClaudeError(w, http.StatusInternalServerError, "api_error", msg)
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
@@ -3201,26 +3218,61 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		req.Model = "claude-sonnet-4"
 	}
 
-	// Build a minimal chat payload
+	// Build a minimal Claude Messages-style probe. This mirrors VS Code Copilot's
+	// custom-endpoint contract for Opus 4.8: same model id, Claude endpoint shape,
+	// and high reasoning effort instead of a model-name thinking suffix.
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
-
-	openaiReq := &OpenAIRequest{
-		Model:     actualModel,
-		Messages:  []OpenAIMessage{{Role: "user", Content: "say ok"}},
-		MaxTokens: 5,
-		Stream:    false,
+	actualModel, thinking := resolveClaudeThinkingMode(req.Model, nil, thinkingCfg.Suffix)
+	defaultThinking := isClaudeModelWithDefaultThinking(req.Model)
+	if !thinking && defaultThinking {
+		thinking = true
 	}
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	var outputConfig *ClaudeOutputConfig
+	if thinking || defaultThinking {
+		outputConfig = &ClaudeOutputConfig{Effort: "high"}
+	}
+
+	claudeReq := &ClaudeRequest{
+		Model:        actualModel,
+		Messages:     []ClaudeMessage{{Role: "user", Content: "say ok"}},
+		MaxTokens:    2048,
+		OutputConfig: outputConfig,
+	}
+	kiroPayload := ClaudeToKiro(claudeReq, thinking)
 
 	var content string
+	var thinkingContent string
+	var inputTokens int
+	var outputTokens int
+	var endpoint string
+	var firstOutputMs int64
+	var attempts []KiroEndpointAttempt
+	start := time.Now()
 	callback := &KiroStreamCallback{
-		OnText:         func(text string, isThinking bool) { content += text },
+		OnText: func(text string, isThinking bool) {
+			if isThinking {
+				thinkingContent += text
+				return
+			}
+			content += text
+		},
 		OnToolUse:      func(tu KiroToolUse) {},
-		OnComplete:     func(inTok, outTok int) {},
+		OnComplete:     func(inTok, outTok int) { inputTokens, outputTokens = inTok, outTok },
 		OnError:        func(err error) {},
 		OnCredits:      func(c float64) {},
 		OnContextUsage: func(pct float64) {},
+		OnEndpointAttempt: func(attempt KiroEndpointAttempt) {
+			attempts = append(attempts, attempt)
+			if attempt.StatusCode == http.StatusOK && !attempt.Skipped {
+				endpoint = attempt.Name
+			}
+		},
+		OnFirstOutput: func(ep string, ms int64) {
+			if firstOutputMs == 0 {
+				firstOutputMs = ms
+				endpoint = ep
+			}
+		},
 	}
 
 	err := CallKiroAPI(account, kiroPayload, callback)
@@ -3231,9 +3283,19 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"reply":   content,
-		"model":   req.Model,
+		"success":          true,
+		"reply":            content,
+		"model":            actualModel,
+		"requestedModel":   req.Model,
+		"thinking":         thinking,
+		"thinkingReceived": thinkingContent != "",
+		"thinkingTokens":   estimateApproxTokens(thinkingContent),
+		"inputTokens":      inputTokens,
+		"outputTokens":     outputTokens,
+		"endpoint":         endpoint,
+		"firstOutputMs":    firstOutputMs,
+		"durationMs":       time.Since(start).Milliseconds(),
+		"attempts":         attempts,
 	})
 }
 

@@ -427,6 +427,45 @@ func TestClaudeEffortInjectsThinkingPrompt(t *testing.T) {
 	}
 }
 
+func TestClaudeOutputConfigEffortInjectsThinkingPrompt(t *testing.T) {
+	payload := ClaudeToKiro(&ClaudeRequest{
+		Model:        "claude-sonnet-5",
+		OutputConfig: &ClaudeOutputConfig{Effort: "high"},
+		Messages:     []ClaudeMessage{{Role: "user", Content: "hello"}},
+		MaxTokens:    1024,
+	}, false)
+	if len(payload.ConversationState.History) == 0 || payload.ConversationState.History[0].UserInputMessage == nil {
+		t.Fatalf("expected system priming history with thinking prompt")
+	}
+	content := payload.ConversationState.History[0].UserInputMessage.Content
+	if !strings.Contains(content, "<thinking_mode>enabled</thinking_mode>") || !strings.Contains(content, "<max_thinking_length>64000</max_thinking_length>") {
+		t.Fatalf("expected high effort thinking prompt, got %q", content)
+	}
+}
+
+func TestClaudeModelWithDefaultThinkingMatchesCopilotFamilies(t *testing.T) {
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{"claude-opus-4.8", true},
+		{"claude-opus-4-8", true},
+		{"claude-sonnet-4.6", true},
+		{"claude-haiku-4.5", true},
+		{"claude-fable-5", true},
+		{"claude-opus-4.8[1m]", false},
+		{"gpt-4o", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := isClaudeModelWithDefaultThinking(tc.model); got != tc.want {
+				t.Fatalf("isClaudeModelWithDefaultThinking(%q) = %v, want %v", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseModelAndThinking(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -582,12 +621,11 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected one image extracted, got %d", len(cur.Images))
 	}
-	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
-		t.Fatalf("expected one tool result")
+	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
+		t.Fatalf("orphaned structured tool result should be flattened before sending upstream")
 	}
-	gotText := cur.UserInputMessageContext.ToolResults[0].Content[0].Text
-	if gotText != "here is the screenshot" {
-		t.Fatalf("expected original tool text preserved, got %q", gotText)
+	if !strings.Contains(cur.Content, "here is the screenshot") {
+		t.Fatalf("expected original tool text preserved in flattened content, got %q", cur.Content)
 	}
 }
 
@@ -653,14 +691,15 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 	payload := OpenAIToKiro(req, false)
 
 	var toolHistImages int
+	var narratedToolResult string
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil &&
-			len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, toolResultImagePlaceholder) {
 			toolHistImages += len(h.UserInputMessage.Images)
+			narratedToolResult = h.UserInputMessage.Content
 		}
 	}
 	if toolHistImages != 1 {
-		t.Fatalf("expected tool image carried on the flushed tool-result history entry, got %d", toolHistImages)
+		t.Fatalf("expected tool image carried on the flattened tool-result history entry, got %d; narration=%q", toolHistImages, narratedToolResult)
 	}
 
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
